@@ -27,6 +27,13 @@ export interface UseAnalyticsResult {
   refetch: () => void;
 }
 
+/**
+ * React hook that fetches and manages analytics data for a given time range.
+ * Pulls spending trend, category breakdown, and budget-vs-actual data from the
+ * on-chain analytics contract, scoped to the connected wallet's account.
+ * @param range - The time range to query ('week', 'month', 'quarter', or 'year').
+ * @returns An UseAnalyticsResult with trend data, loading state, error info, and a refetch function.
+ */
 export function useAnalytics(range: TimeRange): UseAnalyticsResult {
     const { freighter } = useWallet();
     const publicKey = freighter.publicKey;
@@ -42,42 +49,41 @@ export function useAnalytics(range: TimeRange): UseAnalyticsResult {
 
   useEffect(() => {
     if (!publicKey) {
-      setTrend([]);
-      setCategoryBreakdown([]);
-      setBudgetVsActual([]);
       return;
     }
 
     let cancelled = false;
-    setIsLoading(true);
-    setError(null);
+    const timer = window.setTimeout(() => {
+      setIsLoading(true);
+      setError(null);
 
-    const window = getTimeWindow(range);
-    const granularity = getGranularity(range);
+      const window = getTimeWindow(range);
+      const granularity = getGranularity(range);
 
-    Promise.all([
-      getSpendingTrend({ accountPublicKey: publicKey, window, granularity }),
-      getCategoryBreakdown({ accountPublicKey: publicKey, window }),
-      getBudgetVsActual({ accountPublicKey: publicKey, window }),
-    ])
-      .then(([trendData, categoryData, budgetData]) => {
-        if (cancelled) return;
-        setTrend(trendData);
-        setCategoryBreakdown(categoryData);
-        setBudgetVsActual(budgetData);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        setError(err instanceof Error ? err.message : 'Failed to load analytics.');
-      })
-      .finally(() => {
-        if (!cancelled) setIsLoading(false);
-      });
+      Promise.all([
+        getSpendingTrend({ accountPublicKey: publicKey, window, granularity }),
+        getCategoryBreakdown({ accountPublicKey: publicKey, window }),
+        getBudgetVsActual({ accountPublicKey: publicKey, window }),
+      ])
+        .then(([trendData, categoryData, budgetData]) => {
+          if (cancelled) return;
+          setTrend(trendData);
+          setCategoryBreakdown(categoryData);
+          setBudgetVsActual(budgetData);
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return;
+          setError(err instanceof Error ? err.message : 'Failed to load analytics.');
+        })
+        .finally(() => {
+          if (!cancelled) setIsLoading(false);
+        });
+    }, 0);
 
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [publicKey, range, refetchToken]);
 
   return { trend, categoryBreakdown, budgetVsActual, isLoading, error, refetch };

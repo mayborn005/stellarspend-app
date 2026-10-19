@@ -1,6 +1,37 @@
 "use client";
 
 import React, { createContext, useContext, useState, useEffect, useCallback } from "react";
+import {
+  saveEncrypted,
+  loadEncrypted,
+  loadPlaintext,
+  migrateToEncrypted,
+  detectPlaintextData,
+  isPassphraseSet,
+  setPassphraseSet,
+  resetEncryption,
+} from "../lib/crypto/localEncryption";
+import {
+  getProvider,
+  type WalletProviderId,
+} from "../lib/wallet-providers";
+import { fetchBalancesForAddress } from "../lib/api/horizon";
+
+/**
+ * Connection state for the active wallet provider (Freighter, Ledger, xBull,
+ * Albedo). Kept in context so every consumer — the navbar connect button,
+ * send-payment modals, goal forms, etc. — observes the same connection.
+ */
+export interface WalletProviderState {
+  /** The provider currently connected (if any). */
+  providerId: WalletProviderId | null;
+  isInstalled: boolean;
+  isConnected: boolean;
+  publicKey: string | null;
+  isConnecting: boolean;
+  /** Named walletError to avoid clash with wallet context `error`. */
+  walletError: string | null;
+}
 
 export interface Wallet {
   id: string;
@@ -14,13 +45,36 @@ export interface Wallet {
   };
   isDefault: boolean;
   createdAt: number;
+  /**
+   * True when this wallet is linked to a connected signing provider
+   * (e.g. Freighter) and can sign transactions. False/undefined means
+   * the wallet was added manually and is watch-only.
+   */
+  isFreighterLinked?: boolean;
 }
-
+/**
+ * Represents the wallet context state and actions managed by WalletProvider.
+ *
+ * Managed State:
+ * - `wallets`: List of stored wallets including public key, address, balances, and metadata.
+ * - `selectedWallet`: Currently active wallet selected for transactions and views.
+ * - `isLoading`: Boolean indicating whether wallet data is being loaded or processed.
+ * - `isUnlocked`: Boolean indicating whether local encrypted storage is unlocked with session passphrase.
+ * - `error`: Error message string if a wallet operation fails, or null if no error.
+ * - `passphraseSet`: Boolean indicating if an encryption passphrase has been configured.
+ */
 export interface WalletContextType {
   wallets: Wallet[];
   selectedWallet: Wallet | null;
   isLoading: boolean;
+  isUnlocked: boolean;
   error: string | null;
+  passphraseSet: boolean;
+  // Shared wallet-provider connection state (connect/disconnect in one place
+  // so the navbar and payment modals stay in sync).
+  walletProvider: WalletProviderState;
+  connectWalletProvider: (providerId?: WalletProviderId) => Promise<void>;
+  disconnectWalletProvider: () => void;
   addWallet: (wallet: Omit<Wallet, "id" | "createdAt">) => void;
   removeWallet: (id: string) => void;
   selectWallet: (id: string) => void;
@@ -28,6 +82,11 @@ export interface WalletContextType {
   updateWalletName: (id: string, name: string) => void;
   setDefaultWallet: (id: string) => void;
   refreshBalances: () => Promise<void>;
+  unlock: (passphrase: string) => Promise<boolean>;
+  setPassphrase: (passphrase: string) => Promise<void>;
+  changePassphrase: (oldPassphrase: string, newPassphrase: string) => Promise<boolean>;
+  resetLocalData: () => void;
+  lock: () => void;
 }
 
 const WalletContext = createContext<WalletContextType | undefined>(undefined);
@@ -81,75 +140,409 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   const [wallets, setWallets] = useState<Wallet[]>([]);
   const [selectedWalletId, setSelectedWalletId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [isUnlocked, setIsUnlocked] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [passphraseSet, setPassphraseSetState] = useState(isPassphraseSet());
+  const [sessionPassphrase, setSessionPassphrase] = useState<string | null>(null);
+  const [walletProvider, setWalletProvider] = useState<WalletProviderState>({
+    providerId: null,
+    isInstalled: false,
+    isConnected: false,
+    publicKey: null,
+    isConnecting: false,
+    walletError: null,
+  });
 
-  // Load wallets from localStorage on mount
-  useEffect(() => {
-    const loadWallets = () => {
+  // Connect a wallet provider (Freighter, Ledger, xBull, Albedo) and share the
+  // result with every consumer through context.
+  const connectWalletProvider = useCallback(
+    async (providerId: WalletProviderId = "freighter") => {
+      const provider = getProvider(providerId);
+      const installed = await provider.isAvailable().catch(() => false);
+
+      if (!installed && provider.getMeta().kind !== "web") {
+        setWalletProvider({
+          providerId,
+          isInstalled: false,
+          isConnected: false,
+          publicKey: null,
+          isConnecting: false,
+          walletError: `${provider.getMeta().name} not found. Install ${
+            provider.getMeta().kind === "extension" ? "the extension" : "it"
+          } to continue.`,
+        });
+        return;
+      }
+
+      setWalletProvider({
+        providerId,
+        isInstalled: installed,
+        isConnected: false,
+        publicKey: null,
+        isConnecting: true,
+        walletError: null,
+      });
+
       try {
-        const savedWallets = localStorage.getItem(WALLETS_STORAGE_KEY);
-        const savedSelectedId = localStorage.getItem(SELECTED_WALLET_KEY);
+        const publicKey = await provider.connect();
+        if (!publicKey) throw new Error("No public key returned.");
 
-        if (savedWallets) {
-          const parsed = JSON.parse(savedWallets);
-          setWallets(parsed);
-          
-          // Restore selected wallet or select default
-          if (savedSelectedId && parsed.find((w: Wallet) => w.id === savedSelectedId)) {
-            setSelectedWalletId(savedSelectedId);
-          } else {
-            const defaultWallet = parsed.find((w: Wallet) => w.isDefault);
-            setSelectedWalletId(defaultWallet?.id || parsed[0]?.id || null);
-          }
+        setWalletProvider({
+          providerId,
+          isInstalled: true,
+          isConnected: true,
+          publicKey,
+          isConnecting: false,
+          walletError: null,
+        });
+
+        // Link the connected public key to a real wallet entry so it shows
+        // up (and is selected) in the wallet switcher immediately, instead
+        // of leaving the connection stuck in local provider state.
+        const existing = wallets.find(
+          (w) => w.publicKey.toLowerCase() === publicKey.toLowerCase(),
+        );
+
+        const walletId = existing?.id ?? crypto.randomUUID();
+
+        if (existing) {
+          setWallets((prev) =>
+            prev.map((w) =>
+              w.id === existing.id ? { ...w, isFreighterLinked: true } : w,
+            ),
+          );
         } else {
-          // Initialize with mock data if no wallets exist
-          setWallets(MOCK_WALLETS);
-          const defaultWallet = MOCK_WALLETS.find((w) => w.isDefault);
-          setSelectedWalletId(defaultWallet?.id || MOCK_WALLETS[0]?.id);
-          localStorage.setItem(WALLETS_STORAGE_KEY, JSON.stringify(MOCK_WALLETS));
-          localStorage.setItem(SELECTED_WALLET_KEY, defaultWallet?.id || MOCK_WALLETS[0]?.id);
+          const newWallet: Wallet = {
+            id: walletId,
+            name: provider.getMeta().name,
+            address: publicKey,
+            publicKey,
+            balance: { xlm: "0.00", usdc: "0.00", eurc: "0.00" },
+            isDefault: wallets.length === 0,
+            isFreighterLinked: true,
+            createdAt: Date.now(),
+          };
+          setWallets((prev) => [...prev, newWallet]);
+        }
+
+        setSelectedWalletId(walletId);
+
+        // Replace the placeholder/mock balance with a real fetch.
+        try {
+          const result = await fetchBalancesForAddress(publicKey);
+          const balance: Wallet["balance"] = { xlm: "0.00" };
+          for (const b of result.balances) {
+            if (b.asset === "XLM") balance.xlm = b.balance;
+            if (b.asset === "USDC") balance.usdc = b.balance;
+            if (b.asset === "EURC") balance.eurc = b.balance;
+          }
+          setWallets((prev) =>
+            prev.map((w) => (w.id === walletId ? { ...w, balance } : w)),
+          );
+        } catch (balanceErr) {
+          console.error("Failed to fetch balance for linked wallet:", balanceErr);
         }
       } catch (err) {
-        setError("Failed to load wallets");
-        console.error("Failed to load wallets:", err);
-      } finally {
-        setIsLoading(false);
+        const message =
+          err instanceof Error ? err.message : "Failed to connect wallet.";
+        setWalletProvider({
+          providerId,
+          isInstalled: installed,
+          isConnected: false,
+          publicKey: null,
+          isConnecting: false,
+          walletError: message,
+        });
       }
-    };
+    },
+    [wallets],
+  );
 
-    loadWallets();
+  const disconnectWalletProvider = useCallback(() => {
+    if (walletProvider.providerId) {
+      try {
+        getProvider(walletProvider.providerId).disconnect();
+      } catch {
+        // Ignore provider teardown failures; the connection state is cleared
+        // regardless.
+      }
+    }
+
+    // Mark the linked wallet as no longer signable, but keep it in the list
+    // (watch-only) rather than removing it.
+    if (walletProvider.publicKey) {
+      const publicKey = walletProvider.publicKey;
+      setWallets((prev) =>
+        prev.map((w) =>
+          w.publicKey.toLowerCase() === publicKey.toLowerCase()
+            ? { ...w, isFreighterLinked: false }
+            : w,
+        ),
+      );
+    }
+
+    setWalletProvider({
+      providerId: null,
+      isInstalled: false,
+      isConnected: false,
+      publicKey: null,
+      isConnecting: false,
+      walletError: null,
+    });
+  }, [walletProvider.providerId, walletProvider.publicKey]);
+
+  // Load wallets from localStorage on mount
+  const loadWallets = useCallback(async (passphrase?: string) => {
+    try {
+      // First, check if there's plaintext data that needs migration
+      const hasPlaintextWallets = detectPlaintextData(WALLETS_STORAGE_KEY);
+      const hasPlaintextSelected = detectPlaintextData(SELECTED_WALLET_KEY);
+
+      // If passphrase is set and we have plaintext data, migrate it
+      if (passphrase && (hasPlaintextWallets || hasPlaintextSelected)) {
+        // Migrate wallets
+        if (hasPlaintextWallets) {
+          const plaintextWallets = loadPlaintext<Wallet[]>(WALLETS_STORAGE_KEY);
+          if (plaintextWallets) {
+            await migrateToEncrypted(WALLETS_STORAGE_KEY, passphrase, plaintextWallets);
+          }
+        }
+        // Migrate selected wallet ID
+        if (hasPlaintextSelected) {
+          const plaintextSelected = loadPlaintext<string>(SELECTED_WALLET_KEY);
+          if (plaintextSelected) {
+            await migrateToEncrypted(SELECTED_WALLET_KEY, passphrase, plaintextSelected);
+          }
+        }
+        setPassphraseSetState(true);
+        setPassphraseSet();
+      }
+
+      // Try to load encrypted data
+      let loadedWallets: Wallet[] | null = null;
+      let loadedSelectedId: string | null = null;
+
+      if (passphrase) {
+        loadedWallets = await loadEncrypted<Wallet[]>(WALLETS_STORAGE_KEY, passphrase);
+        loadedSelectedId = await loadEncrypted<string>(SELECTED_WALLET_KEY, passphrase);
+      }
+
+      // If no encrypted data, check plaintext
+      if (!loadedWallets) {
+        const plaintext = loadPlaintext<Wallet[]>(WALLETS_STORAGE_KEY);
+        if (plaintext) {
+          loadedWallets = plaintext;
+          // If we have plaintext but passphrase is provided, migrate
+          if (passphrase) {
+            await migrateToEncrypted(WALLETS_STORAGE_KEY, passphrase, plaintext);
+            const plaintextSelected = loadPlaintext<string>(SELECTED_WALLET_KEY);
+            if (plaintextSelected) {
+              await migrateToEncrypted(SELECTED_WALLET_KEY, passphrase, plaintextSelected);
+            }
+            setPassphraseSetState(true);
+            setPassphraseSet();
+          }
+        }
+      }
+
+      // If still no wallets, initialize with mock data
+      if (!loadedWallets) {
+        // If passphrase is set, encrypt mock data
+        if (passphrase) {
+          await saveEncrypted(WALLETS_STORAGE_KEY, MOCK_WALLETS, passphrase);
+          const defaultWallet = MOCK_WALLETS.find(w => w.isDefault);
+          if (defaultWallet) {
+            await saveEncrypted(SELECTED_WALLET_KEY, defaultWallet.id, passphrase);
+          }
+          setPassphraseSetState(true);
+          setPassphraseSet();
+        } else {
+          // Save plaintext mock data (will be migrated on first unlock)
+          localStorage.setItem(WALLETS_STORAGE_KEY, JSON.stringify(MOCK_WALLETS));
+          const defaultWallet = MOCK_WALLETS.find(w => w.isDefault);
+          if (defaultWallet) {
+            localStorage.setItem(SELECTED_WALLET_KEY, defaultWallet.id);
+          }
+        }
+        loadedWallets = MOCK_WALLETS;
+        loadedSelectedId = MOCK_WALLETS.find(w => w.isDefault)?.id || MOCK_WALLETS[0]?.id || null;
+      }
+
+      setWallets(loadedWallets);
+      
+      if (loadedSelectedId) {
+        setSelectedWalletId(loadedSelectedId);
+      } else {
+        const defaultWallet = loadedWallets.find(w => w.isDefault);
+        setSelectedWalletId(defaultWallet?.id || loadedWallets[0]?.id || null);
+      }
+
+      if (passphrase) {
+        setIsUnlocked(true);
+        setSessionPassphrase(passphrase);
+      }
+
+      setPassphraseSetState(isPassphraseSet());
+
+    } catch (err) {
+      setError("Failed to load wallets");
+      console.error("Failed to load wallets:", err);
+    } finally {
+      setIsLoading(false);
+    }
   }, []);
+
+  // Initial load
+  useEffect(() => {
+    const init = async () => {
+      setIsLoading(true);
+      await loadWallets();
+    };
+    init();
+  }, [loadWallets]);
 
   // Save wallets to localStorage whenever they change
   useEffect(() => {
-    if (!isLoading) {
-      localStorage.setItem(WALLETS_STORAGE_KEY, JSON.stringify(wallets));
-    }
-  }, [wallets, isLoading]);
+    const saveWallets = async () => {
+      if (!isLoading && wallets.length > 0 && sessionPassphrase) {
+        try {
+          await saveEncrypted(WALLETS_STORAGE_KEY, wallets, sessionPassphrase);
+        } catch (err) {
+          console.error("Failed to save wallets:", err);
+        }
+      }
+    };
+    saveWallets();
+  }, [wallets, isLoading, sessionPassphrase]);
 
   // Save selected wallet to localStorage
   useEffect(() => {
-    if (!isLoading && selectedWalletId) {
-      localStorage.setItem(SELECTED_WALLET_KEY, selectedWalletId);
+    const saveSelected = async () => {
+      if (!isLoading && selectedWalletId && sessionPassphrase) {
+        try {
+          await saveEncrypted(SELECTED_WALLET_KEY, selectedWalletId, sessionPassphrase);
+        } catch (err) {
+          console.error("Failed to save selected wallet:", err);
+        }
+      }
+    };
+    saveSelected();
+  }, [selectedWalletId, isLoading, sessionPassphrase]);
+
+  const unlock = useCallback(async (passphrase: string): Promise<boolean> => {
+    setIsLoading(true);
+    try {
+      await loadWallets(passphrase);
+      return true;
+    } catch (err) {
+      setError("Invalid passphrase");
+      console.error("Unlock failed:", err);
+      return false;
+    } finally {
+      setIsLoading(false);
     }
-  }, [selectedWalletId, isLoading]);
+  }, [loadWallets]);
+
+  const setPassphrase = useCallback(async (passphrase: string): Promise<void> => {
+    try {
+      // Migrate any existing plaintext data
+      const hasPlaintextWallets = detectPlaintextData(WALLETS_STORAGE_KEY);
+      const hasPlaintextSelected = detectPlaintextData(SELECTED_WALLET_KEY);
+
+      if (hasPlaintextWallets) {
+        const plaintextWallets = loadPlaintext<Wallet[]>(WALLETS_STORAGE_KEY);
+        if (plaintextWallets) {
+          await migrateToEncrypted(WALLETS_STORAGE_KEY, passphrase, plaintextWallets);
+        }
+      }
+      if (hasPlaintextSelected) {
+        const plaintextSelected = loadPlaintext<string>(SELECTED_WALLET_KEY);
+        if (plaintextSelected) {
+          await migrateToEncrypted(SELECTED_WALLET_KEY, passphrase, plaintextSelected);
+        }
+      }
+
+      // If no plaintext data, encrypt current state
+      if (!hasPlaintextWallets && wallets.length > 0) {
+        await saveEncrypted(WALLETS_STORAGE_KEY, wallets, passphrase);
+        if (selectedWalletId) {
+          await saveEncrypted(SELECTED_WALLET_KEY, selectedWalletId, passphrase);
+        }
+      }
+
+      setPassphraseSetState(true);
+      setPassphraseSet();
+      setSessionPassphrase(passphrase);
+      setIsUnlocked(true);
+      
+      // Clear any plaintext data
+      localStorage.removeItem(WALLETS_STORAGE_KEY);
+      localStorage.removeItem(SELECTED_WALLET_KEY);
+
+    } catch (err) {
+      setError("Failed to set passphrase");
+      console.error("Failed to set passphrase:", err);
+      throw err;
+    }
+  }, [wallets, selectedWalletId]);
+
+  const changePassphrase = useCallback(async (oldPassphrase: string, newPassphrase: string): Promise<boolean> => {
+    try {
+      // Verify old passphrase works
+      const testWallets = await loadEncrypted<Wallet[]>(WALLETS_STORAGE_KEY, oldPassphrase);
+      if (!testWallets) {
+        setError("Invalid current passphrase");
+        return false;
+      }
+
+      // Re-encrypt with new passphrase
+      await saveEncrypted(WALLETS_STORAGE_KEY, testWallets, newPassphrase);
+      
+      if (selectedWalletId) {
+        await saveEncrypted(SELECTED_WALLET_KEY, selectedWalletId, newPassphrase);
+      }
+
+      setSessionPassphrase(newPassphrase);
+      return true;
+    } catch (err) {
+      setError("Failed to change passphrase");
+      console.error("Failed to change passphrase:", err);
+      return false;
+    }
+  }, [selectedWalletId]);
+
+  const resetLocalData = useCallback(() => {
+    resetEncryption();
+    localStorage.removeItem(WALLETS_STORAGE_KEY);
+    localStorage.removeItem(SELECTED_WALLET_KEY);
+    setWallets([]);
+    setSelectedWalletId(null);
+    setSessionPassphrase(null);
+    setIsUnlocked(false);
+    setPassphraseSetState(false);
+    // Reload with mock data
+    loadWallets();
+  }, [loadWallets]);
+
+  const lock = useCallback(() => {
+    setIsUnlocked(false);
+    setSessionPassphrase(null);
+  }, []);
 
   const addWallet = useCallback((wallet: Omit<Wallet, "id" | "createdAt">) => {
     const newWallet: Wallet = {
       ...wallet,
-      id: `wallet_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      id: crypto.randomUUID(),
       createdAt: Date.now(),
     };
 
     setWallets((prev) => {
-      // If this is the first wallet, make it default
       if (prev.length === 0) {
         newWallet.isDefault = true;
       }
       return [...prev, newWallet];
     });
 
-    // If no wallet is selected, select the new one
     setSelectedWalletId((prev) => prev || newWallet.id);
   }, []);
 
@@ -158,7 +551,6 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       const walletToRemove = prev.find((w) => w.id === id);
       const remaining = prev.filter((w) => w.id !== id);
       
-      // If removing the default wallet, set a new default
       if (walletToRemove?.isDefault && remaining.length > 0) {
         remaining[0].isDefault = true;
       }
@@ -166,7 +558,6 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       return remaining;
     });
 
-    // If removing the selected wallet, select another one
     setSelectedWalletId((prev) => {
       if (prev === id) {
         const remaining = wallets.filter((w) => w.id !== id);
@@ -179,7 +570,17 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
 
   const selectWallet = useCallback((id: string) => {
     setSelectedWalletId(id);
-  }, []);
+    // Keep the plaintext storage consumed by getConnectedPublicKey() in sync
+    // when no passphrase is configured (demo mode), so the live Horizon
+    // stream and widget fetches follow the switcher immediately.
+    if (!sessionPassphrase) {
+      try {
+        localStorage.setItem(SELECTED_WALLET_KEY, id);
+      } catch (err) {
+        console.error("Failed to persist selected wallet:", err);
+      }
+    }
+  }, [sessionPassphrase]);
 
   const updateWalletBalance = useCallback((id: string, balance: Wallet["balance"]) => {
     setWallets((prev) =>
@@ -207,11 +608,8 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     setError(null);
     
     try {
-      // Simulate API call to fetch balances
       await new Promise((resolve) => setTimeout(resolve, 1000));
       
-      // In a real implementation, this would fetch from Stellar Horizon API
-      // For now, we'll simulate some balance changes
       setWallets((prev) =>
         prev.map((w) => ({
           ...w,
@@ -235,7 +633,12 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     wallets,
     selectedWallet,
     isLoading,
+    isUnlocked,
     error,
+    passphraseSet,
+    walletProvider,
+    connectWalletProvider,
+    disconnectWalletProvider,
     addWallet,
     removeWallet,
     selectWallet,
@@ -243,6 +646,11 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     updateWalletName,
     setDefaultWallet,
     refreshBalances,
+    unlock,
+    setPassphrase,
+    changePassphrase,
+    resetLocalData,
+    lock,
   };
 
   return (
@@ -259,3 +667,4 @@ export function useWalletContext() {
   }
   return context;
 }
+
